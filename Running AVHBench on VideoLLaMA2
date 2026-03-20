@@ -1,0 +1,103 @@
+import argparse
+import json
+import os
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run AVHBench on VideoLLaMA2")
+    parser.add_argument("--qa-json", required=True, help="Path to QA JSON file")
+    parser.add_argument("--video-dir", required=True, help="Directory containing video files")
+    parser.add_argument("--output", required=True, help="Output JSONL path")
+    parser.add_argument(
+        "--model-path",
+        default="DAMO-NLP-SG/VideoLLaMA2.1-7B-AV",
+        help="Model path or HuggingFace model ID",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="Max number of samples to run")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Load QA data
+    with open(args.qa_json, "r") as f:
+        qa_data = json.load(f)
+
+    if args.limit is not None:
+        qa_data = qa_data[:args.limit]
+
+    # Init model
+    from videollama2 import model_init, mm_infer
+
+    print(f"Loading model: {args.model_path}")
+    model, processor, tokenizer = model_init(args.model_path)
+
+    # Ensure model on GPU
+    import torch
+    if torch.cuda.is_available():
+        model = model.cuda()
+
+    print("Model loaded")
+
+    with open(args.output, "w") as out_f:
+        for i, sample in enumerate(qa_data):
+            video_id = sample["video_id"]
+            task = sample["task"]
+            prompt = sample["text"]
+            label = sample["label"]
+
+            video_path = os.path.join(args.video_dir, f"{video_id}.mp4")
+
+            result = {
+                "video_id": video_id,
+                "task": task,
+                "prompt": prompt,
+                "label": label,
+                "prediction": None,
+                "error": None,
+            }
+
+            # Handle missing video
+            if not os.path.exists(video_path):
+                result["error"] = f"Video not found: {video_path}"
+                out_f.write(json.dumps(result) + "\n")
+                out_f.flush()
+                print(f"[{i+1}/{len(qa_data)}] SKIP {video_id} — file missing")
+                continue
+
+            try:
+                # Load video
+                video_tensor = processor["video"](video_path)
+
+                # Ensure tensor on same device as model
+                if hasattr(video_tensor, "cuda") and torch.cuda.is_available():
+                    video_tensor = video_tensor.cuda()
+
+                # Inference
+                prediction = mm_infer(
+                    video_tensor,
+                    prompt,
+                    model=model,
+                    tokenizer=tokenizer,
+                    modal="video",
+                    do_sample=False,
+                )
+
+                result["prediction"] = prediction
+
+            except Exception as e:
+                result["error"] = str(e)
+
+            # Write result immediately
+            out_f.write(json.dumps(result) + "\n")
+            out_f.flush()
+
+            status = "OK" if result["error"] is None else f"ERR: {result['error']}"
+            print(f"[{i+1}/{len(qa_data)}] {video_id} — {status}")
+
+    print(f"Done. Results written to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
