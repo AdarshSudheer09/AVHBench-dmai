@@ -1,0 +1,287 @@
+import os, json, torch, argparse, types, random
+import numpy as np
+from tqdm import tqdm
+from transformers import AutoConfig, AutoTokenizer, logging, GenerationMixin
+from transformers.modeling_utils import PreTrainedModel
+from peft import PeftModel
+from decord import VideoReader, cpu
+from PIL import Image
+import torchvision.transforms as T
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from rouge_score import rouge_scorer
+from videollama2.model.videollama2_qwen2 import Videollama2Qwen2ForCausalLM
+from videollama2.model.projector import STCConnector
+
+def bypass_flash_attn(cls, config, *args, **kwargs):
+    config._attn_implementation = "sdpa"
+    return config
+PreTrainedModel._check_and_enable_flash_attn_2 = classmethod(bypass_flash_attn)
+os.environ['PYTHONWARNINGS'] = 'ignore'
+logging.set_verbosity_error()
+
+MODEL_PATH  = "/home/ubuntu/models/VideoLLaMA2-7B-Qwen2"
+VIDEO_DIR   = "/home/ubuntu/Full_ACCA_64BS/videos"
+ACCA_VISION = "/home/ubuntu/ACCA_Backup/acca_vision_proj_final.pt"
+ACCA_AUDIO  = "/home/ubuntu/ACCA_Backup/acca_audio_proj_final.pt"
+NEGATIVES   = "/home/ubuntu/ACCA_Backup/Negatives(AVCD+AVHBench).json"
+TEST_QA     = "/home/ubuntu/ACCA_Backup/test_QA.json"
+
+CHECKPOINTS = {
+    "acca_only":     "/home/ubuntu/ACCA_Backup/ckpt_acca_only",
+    "acca_tati":     "/home/ubuntu/ACCA_Backup/ckpt_acca_tati",
+    "full_pipeline": "/home/ubuntu/ACCA_Backup/ckpt_full_pipeline",
+}
+TATI_CKPTS = {"acca_tati", "full_pipeline"}
+
+TRANSFORM = T.Compose([
+    T.Resize((378, 378)), T.ToTensor(),
+    T.Normalize(mean=[0.481, 0.457, 0.408], std=[0.268, 0.261, 0.275])
+])
+
+class VisionMLP(nn.Sequential):
+    def __init__(self):
+        super().__init__(nn.Linear(1152, 3584), nn.GELU(), nn.Linear(3584, 3584))
+
+def rouge_l(ref, hyp):
+    s = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=False)
+    return s.score(ref, hyp)['rougeL'].fmeasure
+
+def sensitivity_score(original, perturbed):
+    if not original and not perturbed:
+        return 0.0
+    if not original or not perturbed:
+        return 1.0
+    return round(1.0 - rouge_l(original, perturbed), 4)
+
+def load_frames(video_path):
+    vr = VideoReader(video_path, ctx=cpu(0))
+    idx = np.linspace(0, len(vr) - 1, 16).astype(int)
+    frames = vr.get_batch(idx).asnumpy()
+    return torch.stack([TRANSFORM(Image.fromarray(f)) for f in frames]).unsqueeze(0)
+
+def blank_video():
+    return torch.zeros(1, 16, 3, 378, 378)
+
+def zero_audio():
+    return torch.zeros(1, 1, 729, 1152)
+
+def random_audio():
+    return torch.randn(1, 1, 729, 1152)
+
+def load_model(ckpt_name, device):
+    ckpt_path = CHECKPOINTS[ckpt_name]
+    use_tati  = ckpt_name in TATI_CKPTS
+    cfg = AutoConfig.from_pretrained(MODEL_PATH)
+    cfg.use_flash_attn = False
+    cfg._attn_implementation = "sdpa"
+    base = Videollama2Qwen2ForCausalLM.from_pretrained(
+        MODEL_PATH, config=cfg, torch_dtype=torch.bfloat16).to(device)
+
+    def custom_prepare(input_ids, past_key_values=None, inputs_embeds=None,
+                       attention_mask=None, **kwargs):
+        if past_key_values:
+            input_ids = input_ids[:, -1:]
+        res = {"past_key_values": past_key_values, "use_cache": kwargs.get("use_cache", True)}
+        if inputs_embeds is not None and past_key_values is None:
+            res["inputs_embeds"] = inputs_embeds
+        else:
+            res["input_ids"] = input_ids
+        if attention_mask is not None:
+            res["attention_mask"] = attention_mask
+        return res
+
+    base.prepare_inputs_for_generation = custom_prepare
+    base.generate = types.MethodType(GenerationMixin.generate, base)
+
+    v_proj = VisionMLP().to(device).to(torch.bfloat16)
+    a_proj = STCConnector(cfg).to(device).to(torch.bfloat16)
+    v_proj.load_state_dict(torch.load(ACCA_VISION, map_location=device))
+    a_proj.load_state_dict(torch.load(ACCA_AUDIO,  map_location=device))
+    base.get_model().mm_projector   = v_proj
+    base.get_model().mm_projector_a = a_proj
+
+    model = PeftModel.from_pretrained(base, ckpt_path).to(device)
+    model.eval()
+
+    temporal_emb = None
+    if use_tati:
+        temporal_emb = nn.Embedding(16, 3584).to(device).to(torch.bfloat16)
+        temporal_emb.load_state_dict(torch.load(f"{ckpt_path}/temporal_emb.pt", map_location=device))
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    return model, v_proj, a_proj, temporal_emb, tokenizer
+
+def run_inference(model, v_proj, a_proj, temporal_emb, tokenizer, vf, af, question, device):
+    with torch.autocast(device_type='cuda', dtype=torch.bfloat16), torch.no_grad():
+        vf = vf.to(device).to(torch.bfloat16)
+        af = af.to(device).to(torch.bfloat16)
+        v_feats = model.get_model().vision_tower(vf.view(-1, 3, 378, 378))
+        vp_t    = rearrange(v_proj(v_feats), "(b t) n d -> b t n d", b=1, t=16)
+        ap_raw  = a_proj(af.view(1, 1, 27, 27, -1))
+        ap_t    = ap_raw.unsqueeze(1) if ap_raw.dim() == 3 else ap_raw
+
+        if temporal_emb is not None:
+            ap_flat     = ap_t.flatten(1, 2).transpose(1, 2)
+            ap_interp   = F.interpolate(ap_flat, size=768, mode='linear').transpose(1, 2)
+            ap_temporal = ap_interp.view(1, 16, 48, -1)
+            av_list = []
+            for t_idx in range(16):
+                t_t = torch.tensor(t_idx).to(device)
+                av_list.append(vp_t[:, t_idx] + temporal_emb(t_t))
+                av_list.append(ap_temporal[:, t_idx] + temporal_emb(t_t))
+            av_embeds = torch.cat(av_list, dim=1)
+        else:
+            av_embeds = torch.cat([vp_t.flatten(1, 2), ap_t.flatten(1, 2)], dim=1)
+
+        p_ids    = tokenizer(question, return_tensors="pt").input_ids.to(device)
+        q_embeds = model.get_model().embed_tokens(p_ids)
+        inputs   = torch.cat([av_embeds, q_embeds], dim=1)
+
+        out = model.generate(inputs_embeds=inputs, max_new_tokens=3,
+                             do_sample=False, temperature=1.0, use_cache=True)
+        # when inputs_embeds is used, out contains only the NEW tokens
+        decoded = tokenizer.decode([out[0][0]], skip_special_tokens=True).strip()
+        result  = decoded.split()[0] if decoded else ""
+
+    torch.cuda.empty_cache()
+    return result
+
+def is_correct(pred, label):
+    return int(label.strip().lower() in pred.strip().lower())
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--subset', choices=['conflict', 'clean', 'both'], default='both')
+    parser.add_argument('--max_samples', type=int, default=None)
+    parser.add_argument('--out', type=str, default='modality_sensitivity_results.json')
+    args = parser.parse_args()
+
+    device = torch.device('cuda')
+    random.seed(42)
+
+    with open(NEGATIVES) as f:
+        splits = json.load(f)
+    conflict_ids = set(splits['both_wrong'] + splits['avcd_fixed'])
+
+    with open(TEST_QA) as f:
+        all_qa = json.load(f)
+
+    def has_video(d):
+        return os.path.exists(os.path.join(VIDEO_DIR, str(d['video_id']) + '.mp4'))
+
+    conflict_data = [d for d in all_qa if str(d['video_id']) in conflict_ids and has_video(d)]
+    clean_data    = [d for d in all_qa if str(d['video_id']) not in conflict_ids and has_video(d)]
+
+    if args.max_samples:
+        conflict_data = conflict_data[:args.max_samples]
+        clean_data    = clean_data[:args.max_samples]
+
+    if args.subset == 'conflict':
+        subsets = {'conflict': conflict_data}
+    elif args.subset == 'clean':
+        subsets = {'clean': clean_data}
+    else:
+        subsets = {'conflict': conflict_data, 'clean': clean_data}
+
+    swap_pool   = conflict_data + clean_data
+    all_results = {}
+
+    for ckpt_name in CHECKPOINTS:
+        print(f"\n{'='*60}\n  Checkpoint: {ckpt_name}\n{'='*60}")
+        model, v_proj, a_proj, temporal_emb, tokenizer = load_model(ckpt_name, device)
+        ckpt_results = {}
+
+        for subset_name, subset_data in subsets.items():
+            print(f"\n  Subset: {subset_name} ({len(subset_data)} samples)")
+            records = []
+
+            for item in tqdm(subset_data, desc=f"{ckpt_name}/{subset_name}"):
+                vid_path = os.path.join(VIDEO_DIR, str(item['video_id']) + '.mp4')
+                try:
+                    vf_orig = load_frames(vid_path)
+                except Exception as e:
+                    print(f"  Skipping {item['video_id']}: {e}")
+                    continue
+
+                af_orig = random_audio()
+                pred_orig         = run_inference(model, v_proj, a_proj, temporal_emb, tokenizer, vf_orig,       af_orig,      item['text'], device)
+                pred_audio_masked = run_inference(model, v_proj, a_proj, temporal_emb, tokenizer, vf_orig,       zero_audio(), item['text'], device)
+                pred_video_masked = run_inference(model, v_proj, a_proj, temporal_emb, tokenizer, blank_video(), af_orig,      item['text'], device)
+
+                swap_item = random.choice([d for d in swap_pool if d['video_id'] != item['video_id']])
+                swap_path = os.path.join(VIDEO_DIR, str(swap_item['video_id']) + '.mp4')
+                try:
+                    pred_swapped = run_inference(model, v_proj, a_proj, temporal_emb, tokenizer,
+                                                 load_frames(swap_path), af_orig, item['text'], device)
+                except Exception:
+                    pred_swapped = pred_orig
+
+                records.append({
+                    "video_id":           item['video_id'],
+                    "task":               item['task'],
+                    "ground_truth":       item['label'],
+                    "pred_original":      pred_orig,
+                    "pred_audio_masked":  pred_audio_masked,
+                    "pred_video_masked":  pred_video_masked,
+                    "pred_swapped":       pred_swapped,
+                    "sensitivity_audio":  sensitivity_score(pred_orig, pred_audio_masked),
+                    "sensitivity_video":  sensitivity_score(pred_orig, pred_video_masked),
+                    "sensitivity_swap":   sensitivity_score(pred_orig, pred_swapped),
+                    "correct_original":   is_correct(pred_orig, item['label']),
+                })
+
+            n = len(records)
+            if n == 0:
+                continue
+
+            avg_s_audio = round(sum(r['sensitivity_audio'] for r in records) / n, 4)
+            avg_s_video = round(sum(r['sensitivity_video'] for r in records) / n, 4)
+            avg_s_swap  = round(sum(r['sensitivity_swap']  for r in records) / n, 4)
+            accuracy    = round(sum(r['correct_original']  for r in records) / n, 4)
+            degradation = subset_name == 'clean' and avg_s_video < avg_s_audio * 0.5
+
+            ckpt_results[subset_name] = {
+                "n_samples": n,
+                "accuracy_original": accuracy,
+                "avg_sensitivity_audio_masked": avg_s_audio,
+                "avg_sensitivity_video_masked": avg_s_video,
+                "avg_sensitivity_swapped": avg_s_swap,
+                "clean_subset_degradation_flag": degradation,
+                "records": records,
+            }
+
+            print(f"\n  [{ckpt_name} / {subset_name}]")
+            print(f"    Samples:               {n}")
+            print(f"    Accuracy (original):   {accuracy:.2%}")
+            print(f"    Sensitivity audio-mask:{avg_s_audio:.4f}")
+            print(f"    Sensitivity video-mask:{avg_s_video:.4f}")
+            print(f"    Sensitivity swap:      {avg_s_swap:.4f}")
+            print(f"    Clean degradation flag:{degradation}")
+
+        all_results[ckpt_name] = ckpt_results
+        del model, v_proj, a_proj, temporal_emb
+        torch.cuda.empty_cache()
+
+    with open(args.out, 'w') as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nResults saved to {args.out}")
+
+    print("\n" + "="*70)
+    print("MODALITY SENSITIVITY SUMMARY TABLE")
+    print("="*70)
+    print(f"{'Checkpoint':<20} {'Subset':<10} {'Acc':>6} {'S_audio':>8} {'S_video':>8} {'S_swap':>8} {'Degrad':>7}")
+    print("-"*70)
+    for ckpt_name, subsets_res in all_results.items():
+        for subset_name, res in subsets_res.items():
+            print(f"{ckpt_name:<20} {subset_name:<10} "
+                  f"{res['accuracy_original']:>6.2%} "
+                  f"{res['avg_sensitivity_audio_masked']:>8.4f} "
+                  f"{res['avg_sensitivity_video_masked']:>8.4f} "
+                  f"{res['avg_sensitivity_swapped']:>8.4f} "
+                  f"{'YES' if res['clean_subset_degradation_flag'] else 'no':>7}")
+
+if __name__ == "__main__":
+    main()
+
