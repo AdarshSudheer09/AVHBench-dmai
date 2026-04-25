@@ -1,12 +1,13 @@
-import os, json, torch, argparse, types
+import os, json, torch, argparse, types, subprocess
 from tqdm import tqdm
-from transformers import AutoConfig, AutoTokenizer, logging, GenerationMixin
+from transformers import AutoConfig, AutoTokenizer, AutoProcessor, logging, GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from peft import PeftModel
 from decord import VideoReader, cpu
 import numpy as np
 from PIL import Image
 import torchvision.transforms as T
+import torchaudio
 from videollama2.model.videollama2_qwen2 import Videollama2Qwen2ForCausalLM
 from videollama2.model.projector import STCConnector
 import torch.nn as nn
@@ -42,6 +43,8 @@ def evaluate():
     base_model = Videollama2Qwen2ForCausalLM.from_pretrained(
         model_path, config=cfg, torch_dtype=torch.bfloat16
     ).to(device)
+
+    processor = AutoProcessor.from_pretrained(model_path)
 
     def custom_prepare(input_ids, past_key_values=None, inputs_embeds=None, attention_mask=None, **kwargs):
         if past_key_values:
@@ -97,9 +100,22 @@ def evaluate():
         idx_pts = np.linspace(0, len(vr) - 1, 16).astype(int)
         frames = vr.get_batch(idx_pts).asnumpy()
         vf = torch.stack([transform(Image.fromarray(f)) for f in frames]).unsqueeze(0).to(device).to(torch.bfloat16)
-        af = torch.randn(1, 1, 729, 1152).to(device).to(torch.bfloat16) 
+        
+        a_path = v_path.replace('.mp4', '.wav')
+        if not os.path.exists(a_path):
+            subprocess.call(['ffmpeg', '-i', v_path, '-q:a', '0', '-map', 'a', a_path, '-y'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+        wav, sr = torchaudio.load(a_path)
+        if wav.shape[0] > 1:
+            wav = torch.mean(wav, dim=0, keepdim=True)
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+            
+        a_feat = processor(audios=wav.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")['input_features'].to(device).to(torch.bfloat16)
         
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16), torch.no_grad():
+            af = model.get_model().audio_tower(a_feat)
+            
             v_feats = model.get_model().vision_tower(vf.view(-1, 3, 378, 378))
             vp_t = rearrange(v_proj(v_feats), "(b t) n d -> b t n d", b=1, t=16)
             ap_raw = a_proj(af.view(1, 1, 27, 27, -1))
@@ -118,10 +134,19 @@ def evaluate():
             else:
                 av_embeds = torch.cat([vp_t.flatten(1, 2), ap_t.flatten(1, 2)], dim=1)
 
-            p_ids = tokenizer(item['text'], return_tensors="pt").input_ids.to(device)
+            prompt = f"<|im_start|>user\n{item['text']}<|im_end|>\n<|im_start|>assistant\n"
+            p_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
             inputs = torch.cat([av_embeds, model.get_model().embed_tokens(p_ids)], dim=1)
             
-            outputs = model.generate(inputs_embeds=inputs, max_new_tokens=10)
+            dynamic_mask = torch.ones((1, inputs.shape[1]), dtype=torch.long, device=device)
+            
+            outputs = model.generate(
+                inputs_embeds=inputs, 
+                attention_mask=dynamic_mask,
+                max_new_tokens=10,
+                temperature=0.01,
+                do_sample=False
+            )
             pred = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
             
             results.append({
