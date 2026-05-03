@@ -1,0 +1,156 @@
+"""
+Residual trajectory v2 - measures pull toward predicted token vs. opposite token.
+
+For each Yes/No capture: compute cos(h^l, embed[pred]) - cos(h^l, embed[opposite])
+across all layers. If prior dominance is late-layer: signal stays near 0 through
+~layer 22, then rises sharply at 24-26.
+
+NOTE: This version uses model.embed_tokens.weight, not lm_head.weight, and does
+NOT apply RMSNorm. Results were near-zero (final delta 0.001-0.007), suggesting
+the projection space mismatch. See analyze_trajectory_v3.py for the corrected
+version using lm_head + RMSNorm.
+
+INPUTS:
+  - /workspace/acca_work/residual_output/*.pt
+  - /workspace/VideoLLaMA2-7B-AV/
+
+OUTPUTS:
+  /workspace/acca_work/analysis_output_v2/extended/
+    extended_4b_residual_trajectory_v2.{png,pdf}
+    residual_trajectory_v2.parquet
+"""
+import os, glob, json, time
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from safetensors import safe_open
+from transformers import AutoTokenizer
+
+CAPTURE_RES_DIR = "/workspace/acca_work/residual_output"
+OUT_DIR = "/workspace/acca_work/analysis_output_v2/extended"
+MODEL_PATH = "/workspace/VideoLLaMA2-7B-AV"
+INDEX_FILE = f"{MODEL_PATH}/model.safetensors.index.json"
+
+CONFIG_COLORS = {'baseline':'#7f7f7f','acca':'#1f77b4','tati':'#ff7f0e','full':'#d62728'}
+CONFIG_ORDER = ['baseline','acca','tati','full']
+device = torch.device('cuda')
+
+def savefig(fig, name):
+    fig.savefig(f"{OUT_DIR}/png/{name}.png", dpi=300, bbox_inches='tight')
+    fig.savefig(f"{OUT_DIR}/pdf/{name}.pdf", bbox_inches='tight')
+    plt.close(fig)
+
+# Load embedding matrix
+with open(INDEX_FILE) as f:
+    weight_map = json.load(f)['weight_map']
+shard = weight_map['model.embed_tokens.weight']
+with safe_open(f"{MODEL_PATH}/{shard}", framework="pt", device=0) as f:
+    EMBED_W = f.get_tensor('model.embed_tokens.weight').to(device).to(torch.bfloat16)
+print(f"embed_tokens: {EMBED_W.shape}")
+
+# Tokenizer to find Yes/No token IDs
+tok = AutoTokenizer.from_pretrained(MODEL_PATH)
+yes_ids = set()
+no_ids = set()
+for s in [' Yes',' yes','Yes','yes']:
+    ids = tok.encode(s, add_special_tokens=False)
+    if len(ids)==1: yes_ids.add(ids[0])
+for s in [' No',' no','No','no']:
+    ids = tok.encode(s, add_special_tokens=False)
+    if len(ids)==1: no_ids.add(ids[0])
+print(f"Yes token IDs: {yes_ids}")
+print(f"No token IDs:  {no_ids}")
+
+# Process residual captures
+files = sorted(glob.glob(f"{CAPTURE_RES_DIR}/*.pt"))
+rows = []
+t0 = time.time()
+BATCH = 256
+
+for batch_start in range(0, len(files), BATCH):
+    batch_files = files[batch_start:batch_start+BATCH]
+    last_toks, pred_ids, opp_ids, metas = [], [], [], []
+    for f in batch_files:
+        d = torch.load(f, map_location='cpu', weights_only=False)
+        if not d['is_yn_question']: continue
+        pred = d['snap_target_token']
+        if pred in yes_ids:
+            opp = next(iter(no_ids))
+        elif pred in no_ids:
+            opp = next(iter(yes_ids))
+        else:
+            continue
+        last_toks.append(d['residuals_by_position']['last_tok'])
+        pred_ids.append(pred)
+        opp_ids.append(opp)
+        metas.append({
+            'capture': os.path.basename(f).replace('.pt',''),
+            'config': d['config'],
+            'pred_dir': 'yes' if pred in yes_ids else 'no',
+        })
+    if not last_toks: continue
+    last_tok_b = torch.stack(last_toks).to(device).to(torch.bfloat16)
+    B,L,H = last_tok_b.shape
+    pred_emb = EMBED_W[torch.tensor(pred_ids,device=device,dtype=torch.long)]
+    opp_emb  = EMBED_W[torch.tensor(opp_ids, device=device,dtype=torch.long)]
+
+    @torch.no_grad()
+    def cos_with(ref):
+        r = last_tok_b.float()
+        f = ref.float()
+        rn = r/(r.norm(dim=-1,keepdim=True)+1e-8)
+        fn = f/(f.norm(dim=-1,keepdim=True)+1e-8)
+        return (rn*fn.unsqueeze(1)).sum(-1).cpu().numpy()
+
+    cos_pred = cos_with(pred_emb)
+    cos_opp  = cos_with(opp_emb)
+    delta = cos_pred - cos_opp
+
+    for i,m in enumerate(metas):
+        for lay in range(L):
+            rows.append({**m,'layer':lay,
+                'cos_pred':float(cos_pred[i,lay]),
+                'cos_opp': float(cos_opp[i,lay]),
+                'delta':   float(delta[i,lay])})
+    del last_tok_b
+    torch.cuda.empty_cache()
+    if (batch_start+B)%1024==0:
+        print(f"  [{batch_start+B}/{len(files)}] {time.time()-t0:.1f}s")
+
+df = pd.DataFrame(rows)
+df.to_parquet(f"{OUT_DIR}/residual_trajectory_v2.parquet")
+print(f"Trajectory v2: {len(df)} rows")
+
+fig, ax = plt.subplots(figsize=(9,5))
+for cfg in CONFIG_ORDER:
+    sub = df[df.config==cfg]
+    if len(sub)==0: continue
+    agg = sub.groupby('layer')['delta'].agg(['mean','std','count']).reset_index()
+    ax.plot(agg.layer, agg['mean'], color=CONFIG_COLORS[cfg], lw=2,
+            label=f"{cfg} (n={agg['count'].iloc[0]})")
+    ax.fill_between(agg.layer, agg['mean']-agg['std'], agg['mean']+agg['std'],
+                    color=CONFIG_COLORS[cfg], alpha=0.15)
+ax.axhline(0, color='gray', lw=0.5, ls='--')
+ax.axvline(18, color='gray', lw=0.7, ls='--', alpha=0.5, label='CR heads (L14-18)')
+ax.axvline(25, color='red', lw=0.7, ls='--', alpha=0.5, label='snap layer ~25')
+ax.set_xlabel('layer'); ax.set_ylabel('cos(h, pred) - cos(h, opposite)')
+ax.set_title('Residual pull toward predicted vs. opposite Yes/No token\n'
+             'Late rise = prior crystallization; flat = no commitment yet')
+ax.set_xlim(0,27); ax.grid(True,alpha=0.3); ax.legend(fontsize=9, frameon=False)
+plt.tight_layout(); savefig(fig,'extended_4b_residual_trajectory_v2')
+
+print("\nOnset layer (first layer where delta > 0.01 and keeps rising) per config:")
+for cfg in CONFIG_ORDER:
+    sub = df[df.config==cfg]
+    if len(sub)==0: continue
+    agg = sub.groupby('layer')['delta'].mean()
+    onset = -1
+    for lay in range(len(agg)-2):
+        if agg.iloc[lay] > 0.01 and agg.iloc[lay+1] > agg.iloc[lay] and agg.iloc[lay+2] > agg.iloc[lay+1]:
+            onset = lay; break
+    print(f"  {cfg}: onset at layer {onset}, final delta={agg.iloc[-1]:.3f}")
+
+print(f"\n=== DONE. Output: {OUT_DIR}/extended_4b_residual_trajectory_v2.* ===")
