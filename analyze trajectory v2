@@ -1,0 +1,214 @@
+"""
+Trajectory v3 - uses lm_head (unembedding) and applies final RMSNorm,
+matching the actual logit-lens computation. Picks the opposite token as the
+SAME-CASE counterpart of the predicted token (e.g., predicted ' Yes' -> ' No').
+
+This file incorporates the bug fix to the token-pair mapping that the original
+v3 had. The original bug constructed dict keys that didn't match between Yes
+and No variants, leaving the yes_to_no map empty.
+
+INPUTS:
+  - /workspace/acca_work/residual_output/*.pt
+  - /workspace/VideoLLaMA2-7B-AV/
+
+OUTPUTS:
+  /workspace/acca_work/analysis_output_v2/extended/
+    extended_4c_logit_margin_trajectory.{png,pdf}
+    residual_trajectory_v3.parquet
+"""
+import os, glob, json, time
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from safetensors import safe_open
+from transformers import AutoTokenizer
+
+CAPTURE_RES_DIR = "/workspace/acca_work/residual_output"
+OUT_DIR = "/workspace/acca_work/analysis_output_v2/extended"
+MODEL_PATH = "/workspace/VideoLLaMA2-7B-AV"
+INDEX_FILE = f"{MODEL_PATH}/model.safetensors.index.json"
+
+CONFIG_COLORS = {'baseline':'#7f7f7f','acca':'#1f77b4','tati':'#ff7f0e','full':'#d62728'}
+CONFIG_ORDER = ['baseline','acca','tati','full']
+device = torch.device('cuda')
+
+def savefig(fig, name):
+    fig.savefig(f"{OUT_DIR}/png/{name}.png", dpi=300, bbox_inches='tight')
+    fig.savefig(f"{OUT_DIR}/pdf/{name}.pdf", bbox_inches='tight')
+    plt.close(fig)
+
+# ===== Load lm_head and final RMSNorm =====
+with open(INDEX_FILE) as f:
+    weight_map = json.load(f)['weight_map']
+
+def load_param(name):
+    if name not in weight_map:
+        return None
+    shard = weight_map[name]
+    with safe_open(f"{MODEL_PATH}/{shard}", framework="pt", device=0) as f:
+        return f.get_tensor(name)
+
+LM_HEAD = load_param('lm_head.weight')
+if LM_HEAD is None:
+    print("lm_head.weight not found - embeddings tied; using model.embed_tokens.weight")
+    LM_HEAD = load_param('model.embed_tokens.weight')
+else:
+    print(f"lm_head.weight: {LM_HEAD.shape}")
+LM_HEAD = LM_HEAD.to(device).to(torch.bfloat16)
+
+NORM_W = load_param('model.norm.weight')
+if NORM_W is None:
+    print("WARNING: model.norm.weight not found - skipping final norm")
+    NORM_W = None
+else:
+    NORM_W = NORM_W.to(device).to(torch.bfloat16)
+    print(f"model.norm.weight: {NORM_W.shape}")
+
+def apply_rmsnorm(x, w, eps=1e-6):
+    if w is None: return x
+    var = x.float().pow(2).mean(-1, keepdim=True)
+    x_norm = x.float() * torch.rsqrt(var + eps)
+    return (x_norm * w.float()).to(x.dtype)
+
+# ===== Identify Yes/No token IDs (PATCHED version) =====
+tok = AutoTokenizer.from_pretrained(MODEL_PATH)
+pairs = [
+    (' Yes', ' No'),   # leading space, capitalized
+    ('Yes',  'No'),    # no space, capitalized
+    (' yes', ' no'),   # leading space, lower
+    ('yes',  'no'),    # no space, lower
+]
+yes_to_no, no_to_yes = {}, {}
+yes_id_for, no_id_for = {}, {}
+for ys, ns in pairs:
+    yids = tok.encode(ys, add_special_tokens=False)
+    nids = tok.encode(ns, add_special_tokens=False)
+    if len(yids)==1 and len(nids)==1:
+        yid, nid = yids[0], nids[0]
+        yes_id_for[ys] = yid
+        no_id_for[ns]  = nid
+        yes_to_no[yid] = nid
+        no_to_yes[nid] = yid
+print(f'Yes variants: {yes_id_for}')
+print(f'No variants:  {no_id_for}')
+print(f'Yes->No map:  {yes_to_no}')
+print(f'No->Yes map:  {no_to_yes}')
+
+# ===== Process residual captures =====
+files = sorted(glob.glob(f"{CAPTURE_RES_DIR}/*.pt"))
+rows = []
+t0 = time.time()
+BATCH = 256
+
+for batch_start in range(0, len(files), BATCH):
+    batch_files = files[batch_start:batch_start+BATCH]
+    last_toks, pred_ids, opp_ids, metas = [], [], [], []
+    for f in batch_files:
+        d = torch.load(f, map_location='cpu', weights_only=False)
+        if not d['is_yn_question']: continue
+        pred = d['snap_target_token']
+        if pred in yes_to_no: opp = yes_to_no[pred]; pred_dir='yes'
+        elif pred in no_to_yes: opp = no_to_yes[pred]; pred_dir='no'
+        else: continue
+        last_toks.append(d['residuals_by_position']['last_tok'])
+        pred_ids.append(pred); opp_ids.append(opp)
+        metas.append({
+            'capture': os.path.basename(f).replace('.pt',''),
+            'config': d['config'], 'pred_dir': pred_dir,
+            'snap_layer': d.get('snap_layer', -1),
+        })
+    if not last_toks: continue
+    last_tok_b = torch.stack(last_toks).to(device).to(torch.bfloat16)
+    B,L,H = last_tok_b.shape
+
+    if NORM_W is not None:
+        last_tok_b_normed = apply_rmsnorm(last_tok_b.reshape(-1,H), NORM_W).reshape(B,L,H)
+    else:
+        last_tok_b_normed = last_tok_b
+
+    pred_t = torch.tensor(pred_ids, device=device, dtype=torch.long)
+    opp_t  = torch.tensor(opp_ids,  device=device, dtype=torch.long)
+
+    pred_logit = torch.zeros(B,L, device=device, dtype=torch.float32)
+    opp_logit  = torch.zeros(B,L, device=device, dtype=torch.float32)
+    pred_prob  = torch.zeros(B,L, device=device, dtype=torch.float32)
+
+    with torch.no_grad():
+        for lay in range(L):
+            h = last_tok_b_normed[:, lay, :]
+            logits = (h.float() @ LM_HEAD.float().T)
+            pred_logit[:, lay] = logits.gather(1, pred_t.unsqueeze(1)).squeeze(1)
+            opp_logit[:,  lay] = logits.gather(1, opp_t.unsqueeze(1)).squeeze(1)
+            probs = torch.softmax(logits, dim=-1)
+            pred_prob[:, lay] = probs.gather(1, pred_t.unsqueeze(1)).squeeze(1)
+
+    pred_logit_n = pred_logit.cpu().numpy()
+    opp_logit_n  = opp_logit.cpu().numpy()
+    pred_prob_n  = pred_prob.cpu().numpy()
+    margin = pred_logit_n - opp_logit_n
+
+    for i,m in enumerate(metas):
+        for lay in range(L):
+            rows.append({**m,'layer':lay,
+                'pred_logit': float(pred_logit_n[i,lay]),
+                'opp_logit':  float(opp_logit_n[i,lay]),
+                'margin':     float(margin[i,lay]),
+                'pred_prob':  float(pred_prob_n[i,lay])})
+
+    if batch_start == 0:
+        print(f"\nDiagnostic on first batch (n={B}):")
+        print(f"  Mean pred_prob @ layer 27: {pred_prob_n[:, -1].mean():.3f}")
+        print(f"  Mean pred_prob @ layer 25: {pred_prob_n[:, 25].mean():.3f}")
+        print(f"  Mean pred_prob @ layer 18: {pred_prob_n[:, 18].mean():.3f}")
+        print(f"  Mean margin   @ layer 27: {margin[:, -1].mean():.3f}")
+        print(f"  Mean margin   @ layer 18: {margin[:, 18].mean():.3f}")
+
+    del last_tok_b, last_tok_b_normed, pred_logit, opp_logit, pred_prob
+    torch.cuda.empty_cache()
+    if (batch_start+B)%1024==0:
+        print(f"  [{batch_start+B}/{len(files)}] {time.time()-t0:.1f}s")
+
+df = pd.DataFrame(rows)
+df.to_parquet(f"{OUT_DIR}/residual_trajectory_v3.parquet")
+print(f"\nTrajectory v3: {len(df)} rows")
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharex=True)
+for ax, (col, title) in zip(axes, [
+    ('margin',    'Logit margin: pred - opposite'),
+    ('pred_prob', 'P(predicted token)'),
+]):
+    for cfg in CONFIG_ORDER:
+        sub = df[df.config==cfg]
+        if len(sub)==0: continue
+        agg = sub.groupby('layer')[col].agg(['mean','std','count']).reset_index()
+        ax.plot(agg.layer, agg['mean'], color=CONFIG_COLORS[cfg], lw=2,
+                label=f"{cfg} (n={agg['count'].iloc[0]})")
+        ax.fill_between(agg.layer, agg['mean']-agg['std'], agg['mean']+agg['std'],
+                        color=CONFIG_COLORS[cfg], alpha=0.12)
+    ax.axvline(18, color='gray', lw=0.7, ls='--', alpha=0.5)
+    ax.axvline(25, color='red',  lw=0.7, ls='--', alpha=0.5)
+    ax.axhline(0,  color='gray', lw=0.4, ls='-', alpha=0.5)
+    ax.set_xlabel('layer'); ax.set_ylabel(col)
+    ax.set_title(title); ax.set_xlim(0,27)
+    ax.grid(True, alpha=0.3); ax.legend(fontsize=8, frameon=False)
+fig.suptitle('Late-stage commitment trajectory (logit-lens, with RMSNorm)\n'
+             'Margin > 0 means residual stream favors the predicted token over its opposite', y=1.02)
+plt.tight_layout(); savefig(fig, 'extended_4c_logit_margin_trajectory')
+
+print("\nOnset layer per config (first layer where mean margin > 1.0 and keeps rising):")
+for cfg in CONFIG_ORDER:
+    sub = df[df.config==cfg]
+    if len(sub)==0: continue
+    agg = sub.groupby('layer')['margin'].mean()
+    onset = -1
+    for lay in range(len(agg)-2):
+        if agg.iloc[lay] > 1.0 and agg.iloc[lay+1] > agg.iloc[lay]:
+            onset = lay; break
+    print(f"  {cfg}: onset @ layer {onset}, "
+          f"margin@18={agg.iloc[18]:.2f}, margin@22={agg.iloc[22]:.2f}, "
+          f"margin@25={agg.iloc[25]:.2f}, margin@27={agg.iloc[-1]:.2f}")
+
+print(f"\n=== DONE. ===")
