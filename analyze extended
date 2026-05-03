@@ -1,0 +1,349 @@
+"""
+Extended analyses on top of the v2 logit-lens results.
+
+Adds four things:
+  1. Entropy on the 21 audit heads (case-study captures, ACCA vs TATI only)
+  2. Snap-layer histograms split by predicted Yes/No direction
+  3. Captioning-only logit lens (the 59 captioning Q/A * 4 configs)
+  4. Residual-trajectory analysis: does late-layer residual at answer position
+     stay close to layer-18 (post-conflict-heads) or move toward the predicted
+     token's embedding?
+
+INPUTS:
+  - /workspace/acca_work/residual_output/*.pt   (5,360 captures from v2 run)
+  - /workspace/acca_work/capture_output/*.pt    (38 attention captures, case study)
+  - /workspace/acca_work/analysis_output_v2/per_capture.parquet
+  - /workspace/acca_work/analysis_output_v2/per_layer.parquet
+  - /workspace/acca_work/causal_head_map.json   (output of head ablation audit)
+  - /workspace/VideoLLaMA2-7B-AV/                (model weights)
+
+OUTPUTS:
+  /workspace/acca_work/analysis_output_v2/extended/
+    extended_1_entropy_per_head.{png,pdf}
+    extended_2_snap_by_pred_dir.{png,pdf}
+    extended_3_captioning_logit_lens.{png,pdf}
+    extended_3b_captioning_snap_histogram.{png,pdf}
+    extended_4_residual_trajectory.{png,pdf}
+    entropy_per_head.csv
+    residual_trajectory.parquet
+"""
+import os, glob, json, time
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from safetensors import safe_open
+from transformers import AutoTokenizer
+
+CAPTURE_RES_DIR = "/workspace/acca_work/residual_output"
+CAPTURE_ATTN_DIR = "/workspace/acca_work/capture_output"
+OUT_DIR     = "/workspace/acca_work/analysis_output_v2/extended"
+MODEL_PATH  = "/workspace/VideoLLaMA2-7B-AV"
+INDEX_FILE  = f"{MODEL_PATH}/model.safetensors.index.json"
+HEAD_MAP    = "/workspace/acca_work/causal_head_map.json"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(f"{OUT_DIR}/png", exist_ok=True)
+os.makedirs(f"{OUT_DIR}/pdf", exist_ok=True)
+
+CONFIG_COLORS = {
+    'baseline': '#7f7f7f',
+    'acca':     '#1f77b4',
+    'tati':     '#ff7f0e',
+    'full':     '#d62728',
+}
+CONFIG_ORDER = ['baseline', 'acca', 'tati', 'full']
+device = torch.device('cuda')
+
+def savefig(fig, name):
+    fig.savefig(f"{OUT_DIR}/png/{name}.png", dpi=300, bbox_inches='tight')
+    fig.savefig(f"{OUT_DIR}/pdf/{name}.pdf", bbox_inches='tight')
+    plt.close(fig)
+
+
+# ============================================================
+# ANALYSIS 1: Entropy on the 21 audit heads (case-study captures)
+# ============================================================
+print("\n" + "="*60)
+print("ANALYSIS 1: Entropy on the 21 audit heads (case study)")
+print("="*60)
+
+with open(HEAD_MAP) as f:
+    hm = json.load(f)
+HEADS = [f"L{h['layer']}.H{h['head']}" for h in hm['conflict_resolution_heads']]
+print(f"21 audit heads: {HEADS}")
+
+attn_files = sorted(glob.glob(f"{CAPTURE_ATTN_DIR}/*.pt"))
+print(f"Found {len(attn_files)} attention captures (case-study)")
+
+def entropy_full(attn):
+    """Mean per-row entropy over the saved attention rows.
+    attn shape: [n_query_rows, n_keys] fp16, rows are softmaxed already"""
+    p = attn.float().numpy()
+    p = np.clip(p, 1e-12, 1.0)
+    return float(-(p * np.log(p)).sum(axis=1).mean())
+
+ent_rows = []
+for f in attn_files:
+    d = torch.load(f, map_location='cpu', weights_only=False)
+    cfg = d['config']
+    is_matching = 'matching' in d['question'].lower()
+    for hk in HEADS:
+        if hk not in d['head_attention']: continue
+        ent = entropy_full(d['head_attention'][hk])
+        ent_rows.append({
+            'config': cfg, 'video_id': d['video_id'],
+            'question_hash': d['question_hash'], 'head': hk,
+            'is_matching': is_matching, 'entropy': ent,
+        })
+ent_df = pd.DataFrame(ent_rows)
+
+print("\nMean entropy per config (21 heads, all questions):")
+for cfg in ['acca', 'tati']:
+    sub = ent_df[ent_df.config == cfg]
+    if len(sub) == 0: continue
+    print(f"  {cfg}: mean={sub.entropy.mean():.3f}  std={sub.entropy.std():.3f}  n={len(sub)}")
+
+print("\nMean entropy per config x question type:")
+for cfg in ['acca', 'tati']:
+    for q_type, mask in [('matching', ent_df.is_matching), ('single-modality', ~ent_df.is_matching)]:
+        sub = ent_df[(ent_df.config == cfg) & mask]
+        if len(sub) == 0: continue
+        print(f"  {cfg:5s} x {q_type:15s}: mean={sub.entropy.mean():.3f} std={sub.entropy.std():.3f} n={len(sub)}")
+
+acca_mean = ent_df[ent_df.config == 'acca'].entropy.mean()
+tati_mean = ent_df[ent_df.config == 'tati'].entropy.mean()
+print(f"\nDelta TATI - ACCA: {tati_mean - acca_mean:+.3f}")
+print(f"Paper Table 2 claim: delta = -2.72 (3.84 -> 1.12)")
+print(f"Our finding:        delta = {tati_mean - acca_mean:+.2f} ({acca_mean:.2f} -> {tati_mean:.2f})")
+
+# Figure: entropy by head, ACCA vs TATI
+fig, ax = plt.subplots(figsize=(13, 5))
+heads_sorted = sorted(HEADS, key=lambda h: (int(h.split('.')[0][1:]), int(h.split('.')[1][1:])))
+x = np.arange(len(heads_sorted))
+acca_per_head = [ent_df[(ent_df.config == 'acca') & (ent_df.head == h)].entropy.mean() for h in heads_sorted]
+tati_per_head = [ent_df[(ent_df.config == 'tati') & (ent_df.head == h)].entropy.mean() for h in heads_sorted]
+ax.bar(x - 0.2, acca_per_head, 0.4, color=CONFIG_COLORS['acca'], label='ACCA')
+ax.bar(x + 0.2, tati_per_head, 0.4, color=CONFIG_COLORS['tati'], label='TATI')
+ax.set_xticks(x); ax.set_xticklabels(heads_sorted, rotation=45, ha='right')
+ax.set_ylabel('Mean attention entropy (nats)')
+ax.set_title(f'Entropy per audit head (n={len(attn_files)} case-study captures)\n'
+             f'Paper Table 2: ACCA 3.84 -> TATI 1.12 (delta -2.72) | '
+             f'Our: ACCA {acca_mean:.2f} -> TATI {tati_mean:.2f} (delta {tati_mean-acca_mean:+.2f})')
+ax.legend(); ax.grid(True, alpha=0.3)
+plt.tight_layout(); savefig(fig, "extended_1_entropy_per_head")
+
+ent_df.to_csv(f"{OUT_DIR}/entropy_per_head.csv", index=False)
+print(f"Entropy table saved.")
+
+
+# ============================================================
+# ANALYSIS 2: Snap layer x predicted direction
+# ============================================================
+print("\n" + "="*60)
+print("ANALYSIS 2: Snap layer x predicted direction")
+print("="*60)
+
+pc = pd.read_parquet("/workspace/acca_work/analysis_output_v2/per_capture.parquet")
+yn = pc[pc.is_yn_question & (pc.snap_layer >= 0)].copy()
+yn['pred_dir'] = yn.prediction.str.lower().str.strip().apply(
+    lambda s: 'yes' if s.startswith('yes') else ('no' if s.startswith('no') else 'other')
+)
+print("Counts per (config, pred_dir):")
+print(yn.groupby(['config', 'pred_dir']).size().unstack(fill_value=0))
+
+fig, axes = plt.subplots(1, 4, figsize=(20, 4.5), sharey=True)
+for ax, cfg in zip(axes, CONFIG_ORDER):
+    sub = yn[yn.config == cfg]
+    if len(sub) == 0: ax.set_title(cfg); continue
+    for direction, color in [('yes', '#2ca02c'), ('no', '#9467bd'), ('other', '#7f7f7f')]:
+        d = sub[sub.pred_dir == direction]
+        if len(d) == 0: continue
+        ax.hist(d.snap_layer, bins=range(0, 29), alpha=0.5, color=color, edgecolor=color, lw=1.5,
+                label=f"{direction} (n={len(d)}, mean={d.snap_layer.mean():.1f})")
+    ax.set_title(f"{cfg}", fontsize=12)
+    ax.set_xlabel('snap layer'); ax.set_xlim(15, 28); ax.legend(fontsize=8, frameon=False)
+    ax.grid(True, alpha=0.3)
+axes[0].set_ylabel('count')
+fig.suptitle('Snap layer split by predicted direction (Yes/No questions)', y=1.02)
+plt.tight_layout(); savefig(fig, "extended_2_snap_by_pred_dir")
+
+print("\nMean snap layer by (config, pred_dir):")
+print(yn.groupby(['config', 'pred_dir']).snap_layer.mean().unstack().round(2))
+
+
+# ============================================================
+# ANALYSIS 3: Captioning-only logit lens
+# ============================================================
+print("\n" + "="*60)
+print("ANALYSIS 3: Captioning-only logit lens")
+print("="*60)
+
+pl = pd.read_parquet("/workspace/acca_work/analysis_output_v2/per_layer.parquet")
+cap_pl = pl[~pl.is_yn_question]
+cap_pc = pc[~pc.is_yn_question]
+print(f"Captioning captures: {len(cap_pc)} (across {cap_pc.config.nunique()} configs)")
+
+print("\nMost common first prediction tokens (captioning) per config:")
+for cfg in CONFIG_ORDER:
+    sub = cap_pc[cap_pc.config == cfg]
+    top = sub.snap_target_token.value_counts().head(5)
+    print(f"  {cfg}: {dict(top)}")
+
+print(f"\nMost common predicted strings (first 50 chars):")
+for cfg in CONFIG_ORDER:
+    sub = cap_pc[cap_pc.config == cfg]
+    print(f"  {cfg}:")
+    for pred, n in sub.prediction.str[:50].value_counts().head(5).items():
+        print(f"    [{n:>2}x] {pred!r}")
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True)
+for ax, (col, title) in zip(axes, [
+    ('target_prob', "P(model's first generated token)"),
+    ('a_prob',      'P(" A") - captioning template marker'),
+    ('yes_prob',    'P(" Yes") - should be ~0 for captioning'),
+]):
+    for cfg in CONFIG_ORDER:
+        sub = cap_pl[cap_pl.config == cfg]
+        if len(sub) == 0: continue
+        agg = sub.groupby('layer')[col].agg(['mean', 'std', 'count']).reset_index()
+        ax.plot(agg.layer, agg['mean'], color=CONFIG_COLORS[cfg], lw=2,
+                label=f"{cfg} (n={agg['count'].iloc[0]})")
+        ax.fill_between(agg.layer, agg['mean']-agg['std'], agg['mean']+agg['std'],
+                        color=CONFIG_COLORS[cfg], alpha=0.15)
+    ax.set_xlabel('layer'); ax.set_ylabel('probability')
+    ax.set_title(title); ax.set_xlim(0, 27); ax.grid(True, alpha=0.3); ax.legend(fontsize=8, frameon=False)
+fig.suptitle(f'Logit lens trajectory - captioning Q/A only (n={cap_pc.shape[0]} captures)', y=1.02)
+plt.tight_layout(); savefig(fig, "extended_3_captioning_logit_lens")
+
+fig, ax = plt.subplots(figsize=(9, 4.5))
+cap_yn_pc = cap_pc[cap_pc.snap_layer >= 0]
+for cfg in CONFIG_ORDER:
+    sub = cap_yn_pc[cap_yn_pc.config == cfg]
+    if len(sub) == 0: continue
+    ax.hist(sub.snap_layer, bins=range(0, 29), alpha=0.4,
+            color=CONFIG_COLORS[cfg],
+            label=f"{cfg} (n={len(sub)}, mean={sub.snap_layer.mean():.2f})",
+            edgecolor=CONFIG_COLORS[cfg], lw=1.5)
+ax.set_xlabel('snap layer'); ax.set_ylabel('count')
+ax.set_title(f'Snap layer distribution - captioning Q/A (n={len(cap_yn_pc)})')
+ax.set_xlim(-0.5, 28.5); ax.set_xticks(range(0, 28, 2))
+ax.grid(True, alpha=0.3); ax.legend(frameon=False)
+savefig(fig, "extended_3b_captioning_snap_histogram")
+
+print("\nCaptioning snap layer per config:")
+for cfg in CONFIG_ORDER:
+    sub = cap_yn_pc[cap_yn_pc.config == cfg]
+    if len(sub) == 0: continue
+    print(f"  {cfg}: mean={sub.snap_layer.mean():.2f} std={sub.snap_layer.std():.2f} n={len(sub)}")
+
+
+# ============================================================
+# ANALYSIS 4: Residual-trajectory - override test
+# ============================================================
+print("\n" + "="*60)
+print("ANALYSIS 4: Residual trajectory - override test")
+print("="*60)
+print("Loading lm_head + token embeddings from safetensors...")
+with open(INDEX_FILE) as f:
+    index = json.load(f)
+weight_map = index['weight_map']
+
+def load_param(name):
+    shard = weight_map[name]
+    with safe_open(f"{MODEL_PATH}/{shard}", framework="pt", device=0) as f:
+        return f.get_tensor(name)
+
+EMBED_W = load_param('model.embed_tokens.weight').to(device).to(torch.bfloat16)  # [vocab, hidden]
+print(f"  embed_tokens: {EMBED_W.shape}")
+
+print("Processing residual captures for trajectory analysis...")
+
+files = sorted(glob.glob(f"{CAPTURE_RES_DIR}/*.pt"))
+traj_rows = []
+t0 = time.time()
+BATCH = 256
+
+for batch_start in range(0, len(files), BATCH):
+    batch_files = files[batch_start:batch_start + BATCH]
+    last_toks = []
+    pred_token_ids = []
+    metas = []
+    for f in batch_files:
+        d = torch.load(f, map_location='cpu', weights_only=False)
+        last_toks.append(d['residuals_by_position']['last_tok'])
+        pred_token_ids.append(d['snap_target_token'])
+        metas.append({
+            'capture': os.path.basename(f).replace('.pt',''),
+            'config': d['config'],
+            'is_yn_question': d['is_yn_question'],
+        })
+    last_tok_b = torch.stack(last_toks).to(device).to(torch.bfloat16)  # [B, L, H]
+    B, L, H = last_tok_b.shape
+
+    h18 = last_tok_b[:, 18, :]  # [B, H]
+    pred_idx = torch.tensor(pred_token_ids, device=device, dtype=torch.long)
+    pred_emb = EMBED_W[pred_idx]  # [B, H]
+
+    @torch.no_grad()
+    def cosine_with_ref(residuals, ref):
+        r = residuals.float()
+        f = ref.float()
+        rn = r / (r.norm(dim=-1, keepdim=True) + 1e-8)
+        fn = f / (f.norm(dim=-1, keepdim=True) + 1e-8)
+        return (rn * fn.unsqueeze(1)).sum(-1).cpu().numpy()  # [B, L]
+
+    cos_to_h18  = cosine_with_ref(last_tok_b, h18)
+    cos_to_pred = cosine_with_ref(last_tok_b, pred_emb)
+
+    for i, m in enumerate(metas):
+        for lay in range(L):
+            traj_rows.append({
+                **m, 'layer': lay,
+                'cos_to_h18':  float(cos_to_h18[i, lay]),
+                'cos_to_pred': float(cos_to_pred[i, lay]),
+            })
+
+    del last_tok_b
+    torch.cuda.empty_cache()
+    if (batch_start + B) % 1024 == 0:
+        elapsed = time.time() - t0
+        print(f"  [{batch_start+B}/{len(files)}] {elapsed:.1f}s")
+
+traj_df = pd.DataFrame(traj_rows)
+traj_df.to_parquet(f"{OUT_DIR}/residual_trajectory.parquet")
+print(f"Trajectory table: {len(traj_df)} rows")
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharex=True)
+for ax, (col, title) in zip(axes, [
+    ('cos_to_h18',  'cosine(h_l, h_18)  - similarity to post-conflict-heads state'),
+    ('cos_to_pred', 'cosine(h_l, embed[pred]) - similarity to predicted-token embedding'),
+]):
+    for cfg in CONFIG_ORDER:
+        sub = traj_df[(traj_df.config == cfg) & traj_df.is_yn_question]
+        if len(sub) == 0: continue
+        agg = sub.groupby('layer')[col].agg(['mean', 'std', 'count']).reset_index()
+        ax.plot(agg.layer, agg['mean'], color=CONFIG_COLORS[cfg], lw=2,
+                label=f"{cfg} (n={agg['count'].iloc[0]})")
+        ax.fill_between(agg.layer, agg['mean']-agg['std'], agg['mean']+agg['std'],
+                        color=CONFIG_COLORS[cfg], alpha=0.15)
+    ax.set_xlabel('layer'); ax.set_ylabel('cosine')
+    ax.set_title(title); ax.set_xlim(0, 27); ax.grid(True, alpha=0.3); ax.legend(fontsize=8, frameon=False)
+    ax.axvline(18, color='gray', lw=0.7, ls='--', alpha=0.5)
+fig.suptitle('Residual trajectory at answer position - override test\n'
+             'If prior overrides: left plot drops after layer 18, right plot rises sharply after layer 22', y=1.0)
+plt.tight_layout(); savefig(fig, "extended_4_residual_trajectory")
+
+print("\nCrossover layer (cos_to_pred > cos_to_h18) per config:")
+for cfg in CONFIG_ORDER:
+    sub = traj_df[(traj_df.config == cfg) & traj_df.is_yn_question]
+    if len(sub) == 0: continue
+    agg = sub.groupby('layer')[['cos_to_h18','cos_to_pred']].mean()
+    cross = agg[(agg.cos_to_pred > agg.cos_to_h18)].index
+    cross_layer = int(cross.min()) if len(cross) else -1
+    print(f"  {cfg}: crossover at layer {cross_layer}")
+
+print(f"\n=== ALL DONE. Outputs: {OUT_DIR} ===")
