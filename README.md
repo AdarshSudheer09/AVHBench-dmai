@@ -40,11 +40,10 @@ The core methodology is split across the following scripts in the root directory
 git clone [https://github.com/AdarshSudheer09/AVHBench-dmai.git](https://github.com/AdarshSudheer09/AVHBench-dmai.git)
 cd AVHBench-dmai
 ```
-*(Note: Dependency list pending. Ensure standard PyTorch and Transformers libraries are installed.)*
 
 ## Quick Start
 
-*(Note: Ensure your environment is configured with the necessary weights for VideoLLaMA 2-7B-AV before running.)*
+*(Ensure your environment is configured with the necessary weights for VideoLLaMA 2-7B-AV before running.)*
 
 **Mechanistic Audit**
 ```bash
