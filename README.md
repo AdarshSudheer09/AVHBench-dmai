@@ -3,7 +3,12 @@
 [![Conference](https://img.shields.io/badge/ICML_2026-Accepted-blue)](https://icml.cc)
 [![Workshops](https://img.shields.io/badge/Workshops-FoGen_|_CompLearn_|_Learning_to_Listen-success)](#)
 
-This repository contains the code, data, and mechanistic interpretability tools for the paper: **"Prior Dominance in Audio-Visual LLMs: When Generative Models Memorize Over Reasoning Under Cross-modal Conflict."** Accepted at three ICML 2026 workshops: Foundations of Deep Generative Models (FoGen), Compositional Learning (CompLearn), and Learning to Listen (Machine Learning for Audio).
+This repository contains the code, data, and mechanistic interpretability tools for research accepted at three ICML 2026 workshops. 
+
+**Associated Papers:**
+* **FoGen:** *Prior Dominance in Audio-Visual LLMs: When Generative Models Memorize Over Reasoning Under Cross-modal Conflict*
+* **CompLearn:** *Compositional Failure in Audio-Visual LLMs: Late-Layer Prior Dominance Under Cross-modal Conflict*
+* **Learning to Listen:** *Prior Dominance in Audio-Visual LLMs: When Generative Models Memorize Over Reasoning Under Cross-modal Conflict*
 
 ## Overview
 We investigate where autoregressive Audio-Visual LLMs (specifically VideoLLaMA 2-7B-AV) substitute memorized distributional priors for reasoning when forced to process conflicting cross-modal inputs. 
